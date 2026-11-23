@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Van float switch</title>
+<style>
+  body { font: 17px -apple-system, sans-serif; margin: 16px; max-width: 480px; }
+  button { font: inherit; width: 100%; padding: 14px; margin: 6px 0; border-radius: 10px; border: 1px solid #888; }
+  button:disabled { opacity: .4; }
+  #state { font-weight: 600; margin: 12px 0; }
+  pre { font-size: 12px; white-space: pre-wrap; background: #8881; padding: 8px; border-radius: 8px; max-height: 40vh; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Van float switch</h1>
+<p>Switches the alternator float mode on a Renault Master III / Opel Movano B (X62) through an ELM327-style Bluetooth LE adapter.</p>
+<p>Adapter plugged in, ignition on. On iPhone, open this page in Bluefy.</p>
+<p><strong>At your own risk.</strong> This writes one setting (<code>C_B_FloatingInhibit</code>) to the van's USM. The commands were verified on one 2016 Movano; other vans may have a USM version without this setting. Read the setting first and note the original value.</p>
+<button id="connect">Connect to adapter</button>
+<div id="state" role="status" aria-live="polite">Not connected</div>
+<button id="status" disabled>Read setting</button>
+<button id="inhibit" disabled>Float off (full charging voltage)</button>
+<button id="allow" disabled>Float on (factory)</button>
+<pre id="log" aria-label="Log"></pre>
+<script>
+// Same logic as float.py, over Bluetooth LE. USM: send 74D, reply 76D, CAN 500k.
+const SETUP = ['AT WS','AT E1','AT S0','AT H0','AT L0','AT AL','AT CAF0','AT CFC1','AT SH 74D',
+  'AT FC SH 74D','AT FC SD 30 00 00','AT FC SM 1','AT ST FF','AT AT 0','AT SP 6',
+  'AT CAF0','AT S0','AT AL','AT AT 1','AT CRA 76D'];
+const SESSION = '0210C0', READ = '0322070E';
+const WRITE = { inhibit: '042E070E01', allow: '042E070E00' };  // the only frames this page can write
+const NAMES = { 0: 'Float allowed (factory)', 1: 'Float inhibited (full charging voltage)' };
+// shortcut: guessed service IDs for ELM-style LE adapters, untested on this adapter; replace with the scanned ones if none match.
+const SERVICES = [0x18f0, 0xfff0, 0xffe0, 'e7810a71-73ae-499d-8c15-faa9aef0c3f2'];
+
+const parseValue = r => (r.slice(2, 8) === '62070E' && r.length >= 10) ? parseInt(r.slice(8, 10), 16) : null;
+console.assert(parseValue('0462070E01000000') === 1 && parseValue('0462070E00000000') === 0);
+console.assert(parseValue('037F223100000000') === null && parseValue('NODATA') === null);
+
+const $ = id => document.getElementById(id);
+const log = t => { $('log').textContent += t + '\n'; $('log').scrollTop = 1e9; };
+const setState = t => { $('state').textContent = t; };
+let tx, buf = '', waiter = null, ready = false;
+
+function onData(e) {
+  buf += new TextDecoder().decode(e.target.value);
+  if (waiter && buf.trimEnd().endsWith('>')) { const w = waiter; waiter = null; w(); }
+}
+
+async function cmd(c) {
+  buf = '';
+  const done = new Promise((ok, fail) => {
+    waiter = ok;
+    setTimeout(() => { if (waiter === ok) { waiter = null; fail(new Error('no answer to ' + c)); } }, 8000);
+  });
+  await tx.writeValue(new TextEncoder().encode(c + '\r'));
+  await done;
+  const r = buf.replace(/>/g, '').replace(/\s+/g, '').replace(c.replace(/ /g, ''), '');
+  log(c + ' -> ' + r);
+  return r;
+}
+
+async function connect() {
+  const dev = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: SERVICES });
+  dev.addEventListener('gattserverdisconnected', () => { ready = false; enable(false); setState('Disconnected'); });
+  const gatt = await dev.gatt.connect();
+  let rx;
+  for (const s of await gatt.getPrimaryServices()) {
+    for (const ch of await s.getCharacteristics()) {
+      if (!tx && (ch.properties.write || ch.properties.writeWithoutResponse)) tx = ch;
+      if (!rx && (ch.properties.notify || ch.properties.indicate)) rx = ch;
+    }
+  }
+  if (!tx || !rx) throw new Error('adapter has no usable serial service');
+  rx.addEventListener('characteristicvaluechanged', onData);
+  await rx.startNotifications();
+  for (const c of SETUP) await cmd(c);
+  if (!(await cmd(SESSION)).startsWith('0250C0')) throw new Error('the USM did not answer; is the ignition on?');
+  ready = true;
+}
+
+async function act(action) {
+  const before = parseValue(await cmd(READ));
+  if (before === null) throw new Error('could not read the setting');
+  if (action === 'status') return setState(NAMES[before] ?? String(before));
+  const want = parseInt(WRITE[action].slice(-2), 16);
+  if (before === want) return setState(NAMES[before] + ' (already set, nothing written)');
+  const reply = await cmd(WRITE[action]);
+  const after = parseValue(await cmd(READ));
+  if (!reply.startsWith('036E070E') || after !== want) throw new Error('WRITE NOT CONFIRMED: reply ' + reply + ', now reads ' + after);
+  setState(NAMES[after]);
+}
+
+const enable = on => ['status', 'inhibit', 'allow'].forEach(id => { $(id).disabled = !on; });
+function run(fn) {
+  return async () => {
+    enable(false); $('connect').disabled = true;
+    try { await fn(); } catch (e) { setState('Error: ' + e.message); log(String(e)); }
+    $('connect').disabled = false; enable(ready);
+  };
+}
+$('connect').onclick = run(async () => {
+  if (!navigator.bluetooth) throw new Error('this browser has no Web Bluetooth; open the page in Bluefy');
+  setState('Connecting…'); tx = null; await connect(); await act('status');
+});
+for (const a of ['status', 'inhibit', 'allow']) $(a).onclick = run(() => act(a));
+</script>
+</body>
+</html>
